@@ -22,12 +22,12 @@ os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
 
 def warp_corners_and_draw_matches(ref_points, dst_points, img1, img2):
+    h, w = img1.shape[:2]
     # Calculate the Homography matrix
-    H, mask = cv2.findHomography(ref_points, dst_points, cv2.USAC_MAGSAC, 3.5, maxIters=1_000, confidence=0.999)
+    H, mask = cv2.findHomography(ref_points, dst_points, cv2.USAC_MAGSAC, h*0.01+w*0.01, maxIters=1_000, confidence=0.999)
     mask = mask.flatten()
 
     # Get corners of the first image (image1)
-    h, w = img1.shape[:2]
     corners_img1 = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype=np.float32).reshape(-1, 1, 2)
 
     # Warp corners to the second image (image2) space
