@@ -11,6 +11,7 @@ import numpy as np
 import h5py
 import torch
 from numpy.linalg import inv
+import os
 
 
 try:
@@ -42,20 +43,36 @@ def load_array_from_s3(
 
 
 def imread_gray(path, augment_fn=None, client=SCANNET_CLIENT):
+    path_str = str(path)
+    
+    # 自动纠正后缀大小写
+    if not path_str.startswith('s3://') and not os.path.exists(path_str):
+        if path_str.endswith('.JPG'):
+            alt_path = path_str.replace('.JPG', '.jpg')
+            if os.path.exists(alt_path):
+                path_str = alt_path
+        elif path_str.endswith('.jpg'):
+            alt_path = path_str.replace('.jpg', '.JPG')
+            if os.path.exists(alt_path):
+                path_str = alt_path
+
     cv_type = cv2.IMREAD_GRAYSCALE if augment_fn is None \
                 else cv2.IMREAD_COLOR
-    if str(path).startswith('s3://'):
-        image = load_array_from_s3(str(path), client, cv_type)
+    if path_str.startswith('s3://'):
+        image = load_array_from_s3(path_str, client, cv_type)
     else:
-        image = cv2.imread(str(path), 1)
+        image = cv2.imread(path_str, 1)
+
+    if image is None:
+         raise FileNotFoundError(f"Image not found: {path_str}")
 
     if augment_fn is not None:
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        # 原代码这里又读了一次，我们直接复用上面的路径 path_str
+        image = cv2.imread(path_str, cv2.IMREAD_COLOR)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = augment_fn(image)
         image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     return image  # (h, w)
-
 
 def get_resized_wh(w, h, resize=None):
     if resize is not None:  # resize the longer edge

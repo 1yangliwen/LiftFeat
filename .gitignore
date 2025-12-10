@@ -1,6 +1,9 @@
 visualize
 trained_weights
-data/HPatch
-data/megadepth_test_1500
+data
 output
 issues
+ckpts
+third_party
+dataset/visual_odometry
+__pycache__/

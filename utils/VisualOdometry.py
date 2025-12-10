@@ -5,6 +5,9 @@ import cv2
 import logging
 import glob
 
+from .feature_extractor import FeatureExtractor
+from models.ripe_wrapper import RIPEWrapper
+
 def create_dataloader(conf):
     try:
         code_line = f"{conf['name']}(conf)"
@@ -100,14 +103,38 @@ class KITTILoader(object):
         return self.img_N - self.config["start"]
     
 
-def create_detector(conf):
-    try:
-        code_line = f"{conf['name']}(conf)"
-        detector = eval(code_line)
-    except NameError:
-        raise NotImplementedError(f"{conf['name']} is not implemented yet.")
+# def create_detector(conf):
+#     try:
+#         code_line = f"{conf['name']}(conf)"
+#         detector = eval(code_line)
+#     except NameError:
+#         raise NotImplementedError(f"{conf['name']} is not implemented yet.")
 
-    return detector
+#     return detector
+def create_detector(conf):
+    # ==================== 修改/确认的部分 ====================
+    # 你的 LiftFeat Detector Wrapper 可能需要在这里导入
+    from models.liftfeat_wrapper import LiftFeat 
+
+    detector_name = conf['name']
+    
+    if detector_name == 'LiftFeatDetector':
+        # 这里假设 LiftFeat 类本身就符合 FeatureExtractor 的接口要求
+        # 注意: LiftFeat 的 extract 方法返回值需要适配 VisualOdometry
+        # 你的 LiftFeat Wrapper 可能需要在这里被调用
+        return LiftFeat(weight=None, detect_threshold=conf['keypoint_threshold'])
+    
+    elif detector_name == 'RIPE':
+        # 新增的分支，用于创建 RIPE 模型
+        return RIPEWrapper(conf)
+        
+    # 在这里可以继续添加其他模型, 例如 SIFT
+    # elif detector_name == 'SIFT':
+    #     return SIFTWrapper(conf)
+        
+    else:
+        raise NotImplementedError(f"{detector_name} is not implemented yet.")
+    # =======================================================
 
 
 def create_matcher(conf):
@@ -229,11 +256,23 @@ class FrameByFrameMatcher(object):
 
 # --- VISUALIZATION ---
 # based on: https://github.com/magicleap/SuperGluePretrainedNetwork/blob/master/models/utils.py
-def plot_keypoints(image, kpts):
-    kpts = np.round(kpts).astype(int)
-    for x, y in kpts:
-        cv2.drawMarker(image, (x, y), (0, 255, 0), cv2.MARKER_CROSS, 6)
+# def plot_keypoints(image, kpts):
+#     kpts = np.round(kpts).astype(int)
+#     for x, y in kpts:
+#         cv2.drawMarker(image, (x, y), (0, 255, 0), cv2.MARKER_CROSS, 6)
 
+#     return image
+def plot_keypoints(image, kpts):
+    # 这个函数现在可能需要处理 cv2.KeyPoint 对象列表
+    # 而不是 (N,2) 的 numpy 数组
+    if isinstance(kpts, np.ndarray):
+        kpts = np.round(kpts).astype(int)
+        for x, y in kpts:
+            cv2.drawMarker(image, (x, y), (0, 255, 0), cv2.MARKER_CROSS, 6)
+    else: # 假设是 KeyPoint 对象列表
+        for kp in kpts:
+            x, y = int(round(kp.pt[0])), int(round(kp.pt[1]))
+            cv2.drawMarker(image, (x, y), (0, 255, 0), cv2.MARKER_CROSS, 6)
     return image
 
 class VisualOdometry(object):

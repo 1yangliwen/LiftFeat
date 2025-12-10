@@ -6,7 +6,7 @@
 import sys
 import os
 
-ALIKE_PATH = '/home/yepeng_liu/code_python/multimodal_remote/ALIKE'
+ALIKE_PATH = '/home/yangliwen/project/ALIKE'
 sys.path.append(ALIKE_PATH)
 
 import torch
