@@ -143,14 +143,15 @@ python evaluation/MegaDepth1500_evaluation.py
 ## Citation
 If you find this code useful for your research, please cite the paper:
 ```bibtex
-@misc{liu2025liftfeat3dgeometryawarelocal,
-      title={LiftFeat: 3D Geometry-Aware Local Feature Matching}, 
-      author={Yepeng Liu and Wenpeng Lai and Zhou Zhao and Yuxuan Xiong and Jinchi Zhu and Jun Cheng and Yongchao Xu},
-      year={2025},
-      eprint={2505.03422},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2505.03422}, 
+@INPROCEEDINGS{11127853,
+  author={Liu, Yepeng and Lai, Wenpeng and Zhao, Zhou and Xiong, Yuxuan and Zhu, Jinchi and Cheng, Jun and Xu, Yongchao},
+  booktitle={2025 IEEE International Conference on Robotics and Automation (ICRA)}, 
+  title={LiftFeat: 3D Geometry-Aware Local Feature Matching}, 
+  year={2025},
+  volume={},
+  number={},
+  pages={11714-11720},
+  doi={10.1109/ICRA55743.2025.11127853}
 }
 ```
 
