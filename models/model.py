@@ -389,20 +389,47 @@ class LiftFeatSPModel(nn.Module):
        
         return des_map, keypoint_map, d_feats
         # return des_map, keypoint_map, heatmap, d_feats
-    
+               
     def forward2(self, descs, kpts, normals):
         # import pdb;pdb.set_trace()
+        B, C, H, W = descs.shape
         normals_feat=self._unfold2d(normals, ws=8)
-        normals_v=normals_feat.squeeze(0).permute(1,2,0).reshape(-1,normals_feat.shape[1])
-        descs_v=descs.squeeze(0).permute(1,2,0).reshape(-1,descs.shape[1])
-        kpts_v=kpts.squeeze(0).permute(1,2,0).reshape(-1,kpts.shape[1])
+        # 3. 调整维度顺序: [B, H, W, C]
+        descs_perm = descs.permute(0, 2, 3, 1)
+        kpts_perm = kpts.permute(0, 2, 3, 1)
+        normals_perm = normals_feat.permute(0, 2, 3, 1)
+
+        # 4. 关键修改：保留 Batch 维度，只展平空间维度 H, W
+        # 目标形状: [B, N_points, C]  (其中 N_points = H * W)
+        descs_v = descs_perm.reshape(B, -1, self.descriptor_dim)
+        kpts_v = kpts_perm.reshape(B, -1, 65) 
+        normals_v = normals_perm.reshape(B, -1, normals_feat.shape[1])
         descs_refine = self.feature_boost(descs_v, kpts_v, normals_v)
+        # 6. 恢复形状 [B, N, C] -> [B, H, W, C] -> [B, C, H, W]
+        descs_refine = descs_refine.reshape(B, H, W, -1).permute(0, 3, 1, 2)
         return descs_refine
     
-    def forward(self,x):
-        M1,K1,D1=self.forward1(x)
-        descs_refine=self.forward2(M1,K1,D1)
-        return descs_refine,M1,K1,D1
+    # def forward(self,x):
+    #     M1,K1,D1=self.forward1(x)
+    #     descs_refine=self.forward2(M1,K1,D1)
+    #     return descs_refine,M1,K1,D1
+    def forward(self, x, y=None, z=None, mode='extract'):
+        if mode == 'extract':
+            # 对应 forward1
+            return self.forward1(x)
+        
+        elif mode == 'boost':
+            # 对应 forward2
+            # x=descs, y=kpts, z=normals
+            return self.forward2(x, y, z)
+            
+        elif mode == 'match':
+            # 对应 fine_matcher
+            # x 是拼接好的特征对 [Batch, ..., Input_Dim]
+            return self.fine_matcher(x)
+        
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
     
 
 if __name__ == "__main__":

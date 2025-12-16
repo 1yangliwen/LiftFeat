@@ -79,8 +79,11 @@ class MegaDepth1500(Dataset):
         return data
 
 if __name__ == "__main__":
-    weights=os.path.join(os.path.dirname(__file__),'../weights/LiftFeat.pth')
+    weights=os.path.join(os.path.dirname(__file__),'../ckpts/LiftFeat_160000.pth')
     liftfeat=LiftFeat(weight=weights)
+    print("Model keys:", list(liftfeat.net.state_dict().keys())[0])
+    print("Loaded weight keys:", list(torch.load(weights).keys())[0])
+    breakpoint()
     
     dataset = MegaDepth1500(json_file = DATASET_JSON, root_dir = DATASET_ROOT)
 

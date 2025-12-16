@@ -129,6 +129,68 @@ class DepthAnythingExtractor(nn.Module):
         depth_t=torch.from_numpy(depth).float().to(self.device)
         normal_map = self.compute_normal_map_torch(depth_t,1.0)
         return depth_t,normal_map
+
+    def forward(self, images):
+        """
+        支持多卡并行的 Forward 函数
+        Args:
+            images: [B, 3, H, W] Tensor, 范围 0-1, RGB顺序 (来自 train.py 的 imgs_t)
+        Returns:
+            depths: [B, H, W]
+            normals: [B, H, W, 3]
+        """
+        # 1. 预处理 (在 GPU 上进行)
+        # DepthAnything 需要的均值和方差
+        mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(1, 3, 1, 1)
+        
+        # Resize 到模型输入大小 (self.input_size)
+        # 注意: images 是 0-1，NormalizeImage 也是处理 0-1，所以直接减均值除方差
+        x = F.interpolate(images, size=(self.input_size, self.input_size), 
+                          mode='bilinear', align_corners=False)
+        x = (x - mean) / std
+
+        # 2. 模型推理 (Batch 并行)
+        # self.net 是 DepthAnythingV2，它支持 Batch 输入
+        depth = self.net(x) 
+        
+        # 3. 后处理 (Resize 回原始处理分辨率 self.process_size)
+        H, W = self.process_size
+        depth = F.interpolate(depth[:, None], size=(H, W), mode='bilinear', align_corners=True)[:, 0]
+        
+        # 4. 计算法向量 (Batch 并行)
+        # 我们需要把原来单张处理的 compute_normal_map_torch 改成支持 Batch
+        # 或者在这里简单循环一下 (因为显存里已经是 Batch 了，很快)
+        # 更优解是重写 compute_normal_map_torch 支持 Batch (下面提供)
+        normals = self.compute_normal_map_batch(depth)
+        
+        return depth, normals
+    
+    
+    def compute_normal_map_batch(self, depth_batch, scale=1.0):
+        # depth_batch: [B, H, W]
+        B, H, W = depth_batch.shape
+        
+        # 梯度计算 (利用切片实现差分)
+        # dzdx: z(x+1) - z(x)
+        dzdx = torch.zeros_like(depth_batch)
+        dzdx[:, :, :-1] = depth_batch[:, :, 1:] - depth_batch[:, :, :-1]
+        dzdx[:, :, -1] = dzdx[:, :, -2] # 边缘填充
+        dzdx *= scale
+
+        dzdy = torch.zeros_like(depth_batch)
+        dzdy[:, :-1, :] = depth_batch[:, 1:, :] - depth_batch[:, :-1, :]
+        dzdy[:, -1, :] = dzdy[:, -2, :]
+        dzdy *= scale
+
+        # 构造法向量 [B, H, W, 3]
+        normal_map = torch.stack([-dzdx, -dzdy, torch.ones_like(depth_batch)], dim=-1)
+        
+        # 归一化
+        norm = torch.linalg.norm(normal_map, dim=-1, keepdim=True)
+        normal_map = normal_map / (norm + 1e-6)
+        
+        return normal_map
     
     
 if __name__=="__main__":

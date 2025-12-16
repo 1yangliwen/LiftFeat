@@ -43,10 +43,24 @@ def parse_arguments():
     parser.add_argument('--save_ckpt_every', type=int, default=500,
                         help='Save checkpoints every N steps. Default is 500.')
     parser.add_argument('--use_coord_loss',action='store_true',help='Enable coordinate loss')
+    
+    # Distributed training arguments
+    parser.add_argument('--distributed', action='store_true',
+                        help='Enable distributed training (multi-GPU)')
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='Local rank for distributed training (auto-set by launcher)')
+    parser.add_argument('--world_size', type=int, default=1,
+                        help='Number of GPUs to use for training')
+    parser.add_argument('--dist_backend', type=str, default='nccl',
+                        help='Distributed backend (nccl for GPU, gloo for CPU)')
+    parser.add_argument('--dist_url', type=str, default='env://',
+                        help='URL used to set up distributed training')
 
     args = parser.parse_args()
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.device_num
+    # 分布式训练时不设置 CUDA_VISIBLE_DEVICES，由 launcher 管理
+    if not args.distributed:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.device_num
 
     return args
 
@@ -58,6 +72,9 @@ from torch import optim
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 import numpy as np
 import tqdm
@@ -78,6 +95,43 @@ from dataset.coco_augmentor import COCOAugmentor
 import setproctitle
 
 
+def setup_distributed(args):
+    """初始化分布式训练环境"""
+    if args.distributed:
+        # 初始化进程组
+        if args.local_rank == -1:
+            # 从环境变量获取 local_rank
+            args.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        
+        torch.cuda.set_device(args.local_rank)
+        
+        dist.init_process_group(
+            backend=args.dist_backend,
+            init_method=args.dist_url,
+            world_size=args.world_size,
+            rank=args.local_rank
+        )
+        
+        # 同步所有进程
+        dist.barrier()
+        
+        print(f"[Rank {args.local_rank}] Distributed training initialized")
+        print(f"[Rank {args.local_rank}] World size: {dist.get_world_size()}")
+    
+    return args
+
+
+def cleanup_distributed():
+    """清理分布式训练环境"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    """判断是否为主进程"""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
 class Trainer():
     def __init__(self, megadepth_root_path,use_megadepth,megadepth_batch_size,
                        coco_root_path,use_coco,coco_batch_size,
@@ -85,15 +139,40 @@ class Trainer():
                        model_name = 'LiftFeat',
                        n_steps = 160_000, lr= 3e-4, gamma_steplr=0.5, 
                        training_res = (800, 608), device_num="0", dry_run = False,
-                       save_ckpt_every = 500, use_coord_loss = False):
-        print(f'MegeDepth: {use_megadepth}-{megadepth_batch_size}')
-        print(f'COCO20k: {use_coco}-{coco_batch_size}')
-        print(f'Coordinate loss: {use_coord_loss}')
-        self.dev = torch.device ('cuda' if torch.cuda.is_available() else 'cpu')
+                       save_ckpt_every = 500, use_coord_loss = False,
+                       distributed=False, local_rank=-1, world_size=1):
+        # 保存分布式训练参数
+        self.distributed = distributed
+        self.local_rank = local_rank
+        self.world_size = world_size
+        
+        # 只在主进程打印信息
+        if is_main_process():
+            print(f'MegeDepth: {use_megadepth}-{megadepth_batch_size}')
+            print(f'COCO20k: {use_coco}-{coco_batch_size}')
+            print(f'Coordinate loss: {use_coord_loss}')
+            print(f'Distributed: {distributed}, World Size: {world_size}')
+        
+        # 设置设备
+        if self.distributed:
+            self.dev = torch.device(f'cuda:{local_rank}')
+        else:
+            self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # training model
         self.net = LiftFeatSPModel(featureboost_config, use_kenc=False, use_normal=True, use_cross=True).to(self.dev)
-        self.loss_fn=LiftFeatLoss(self.dev,lam_descs=1,lam_kpts=2,lam_heatmap=1)
+        
+        # 分布式训练：将 BatchNorm 转换为 SyncBatchNorm，并用 DDP 包装模型
+        if self.distributed:
+            self.net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.net)
+            self.net = DDP(
+                self.net,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=True  # 如果有未使用的参数
+            )
+        
+        self.loss_fn = LiftFeatLoss(self.dev, lam_descs=1, lam_kpts=2, lam_heatmap=1)
         
         # depth-anything model
         self.depth_net=DepthAnythingExtractor('vits',self.dev,256)
@@ -127,8 +206,10 @@ class Trainer():
 
 
         ##################### MEGADEPTH INIT ##########################
-        self.use_megadepth=use_megadepth
-        self.megadepth_batch_size=megadepth_batch_size
+        self.use_megadepth = use_megadepth
+        self.megadepth_batch_size = megadepth_batch_size
+        self.megadepth_sampler = None  # 初始化 sampler
+        
         if self.use_megadepth:
             TRAIN_BASE_PATH = f"{megadepth_root_path}/train_data/megadepth_indices"
             TRAINVAL_DATA_SOURCE = f"{megadepth_root_path}/MegaDepth_v1"
@@ -136,22 +217,66 @@ class Trainer():
             TRAIN_NPZ_ROOT = f"{TRAIN_BASE_PATH}/scene_info_0.1_0.7"
 
             npz_paths = glob.glob(TRAIN_NPZ_ROOT + '/*.npz')[:]
-            megadepth_dataset = torch.utils.data.ConcatDataset( [MegaDepthDataset(root_dir = TRAINVAL_DATA_SOURCE,
-                            npz_path = path) for path in tqdm.tqdm(npz_paths, desc="[MegaDepth] Loading metadata")] )
+            
+            # 只在主进程显示进度条
+            if is_main_process():
+                npz_iter = tqdm.tqdm(npz_paths, desc="[MegaDepth] Loading metadata")
+            else:
+                npz_iter = npz_paths
+                
+            megadepth_dataset = torch.utils.data.ConcatDataset(
+                [MegaDepthDataset(root_dir=TRAINVAL_DATA_SOURCE, npz_path=path) for path in npz_iter]
+            )
 
-            self.megadepth_dataloader = DataLoader(megadepth_dataset, batch_size=megadepth_batch_size, shuffle=True)
+            # 创建分布式采样器
+            if self.distributed:
+                self.megadepth_sampler = DistributedSampler(
+                    megadepth_dataset,
+                    num_replicas=self.world_size,
+                    rank=self.local_rank,
+                    shuffle=True,
+                    drop_last=True
+                )
+                self.megadepth_dataloader = DataLoader(
+                    megadepth_dataset,
+                    batch_size=megadepth_batch_size,
+                    sampler=self.megadepth_sampler,
+                    num_workers=4,
+                    pin_memory=True,
+                    drop_last=True
+                )
+            else:
+                self.megadepth_dataloader = DataLoader(
+                    megadepth_dataset,
+                    batch_size=megadepth_batch_size,
+                    shuffle=True,
+                    num_workers=4,
+                    pin_memory=True
+                )
+            
             self.megadepth_data_iter = iter(self.megadepth_dataloader)
         ##################### MEGADEPTH INIT END #######################
 
-        os.makedirs(ckpt_save_path, exist_ok=True)
-        os.makedirs(ckpt_save_path + '/logdir', exist_ok=True)
+        # 只在主进程创建目录和 TensorBoard Writer
+        if is_main_process():
+            os.makedirs(ckpt_save_path, exist_ok=True)
+            os.makedirs(ckpt_save_path + '/logdir', exist_ok=True)
+            self.writer = SummaryWriter(ckpt_save_path + f'/logdir/{model_name}_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
+        else:
+            self.writer = None
 
         self.dry_run = dry_run
         self.save_ckpt_every = save_ckpt_every
         self.ckpt_save_path = ckpt_save_path
-        self.writer = SummaryWriter(ckpt_save_path + f'/logdir/{model_name}_' + time.strftime("%Y_%m_%d-%H_%M_%S"))
         self.model_name = model_name
         self.use_coord_loss = use_coord_loss
+    
+    @property
+    def model(self):
+        """获取底层模型（DDP包装时返回.module，否则返回原模型）"""
+        if self.distributed:
+            return self.net.module
+        return self.net
         
         
     def generate_train_data(self):
@@ -198,137 +323,152 @@ class Trainer():
 
     def train(self):
         self.net.train()
+        
+        # 分布式训练时设置 sampler 的 epoch（用于数据打乱）
+        current_epoch = 0
+        if self.distributed and self.megadepth_sampler is not None:
+            self.megadepth_sampler.set_epoch(current_epoch)
 
-        with tqdm.tqdm(total=self.steps) as pbar:
-            for i in range(self.steps):
-                # import pdb;pdb.set_trace()
-                imgs1_t,imgs2_t,imgs1_np,imgs2_np,positives_coarse=self.generate_train_data()
+        # 只在主进程显示进度条
+        pbar = tqdm.tqdm(total=self.steps, disable=not is_main_process())
+        
+        for i in range(self.steps):
+            # import pdb;pdb.set_trace()
+            imgs1_t, imgs2_t, imgs1_np, imgs2_np, positives_coarse = self.generate_train_data()
 
-                #Check if batch is corrupted with too few correspondences
-                is_corrupted = False
-                for p in positives_coarse:
-                    if len(p) < 30:
-                        is_corrupted = True
+            # Check if batch is corrupted with too few correspondences
+            is_corrupted = False
+            for p in positives_coarse:
+                if len(p) < 30:
+                    is_corrupted = True
 
-                if is_corrupted:
-                    continue
+            if is_corrupted:
+                continue
 
-                # import pdb;pdb.set_trace()
-                #Forward pass
-                # start=time.perf_counter()
-                feats1,kpts1,normals1 = self.net.forward1(imgs1_t)
-                feats2,kpts2,normals2 = self.net.forward1(imgs2_t)
+            # import pdb;pdb.set_trace()
+            # Forward pass - 使用 self.model 获取底层模型
+            # start=time.perf_counter()
+            feats1, kpts1, normals1 = self.model.forward1(imgs1_t)
+            feats2, kpts2, normals2 = self.model.forward1(imgs2_t)
+            
+            coordinates, fb_coordinates = [], []
+            alike_kpts1, alike_kpts2 = [], []
+            DA_normals1, DA_normals2 = [], []
+            
+            # import pdb;pdb.set_trace()
+            
+            fb_feats1, fb_feats2 = [], []
+            for b in range(feats1.shape[0]):
+                feat1 = feats1[b].permute(1, 2, 0).reshape(-1, feats1.shape[1])
+                feat2 = feats2[b].permute(1, 2, 0).reshape(-1, feats2.shape[1])
                 
-                coordinates,fb_coordinates=[],[]
-                alike_kpts1,alike_kpts2=[],[]
-                DA_normals1,DA_normals2=[],[]
+                coordinate = self.model.fine_matcher(torch.cat([feat1, feat2], dim=-1))
+                coordinates.append(coordinate)
                 
-                # import pdb;pdb.set_trace()
+                fb_feat1 = self.model.forward2(feats1[b].unsqueeze(0), kpts1[b].unsqueeze(0), normals1[b].unsqueeze(0))
+                fb_feat2 = self.model.forward2(feats2[b].unsqueeze(0), kpts2[b].unsqueeze(0), normals2[b].unsqueeze(0))
                 
-                fb_feats1,fb_feats2=[],[]
-                for b in range(feats1.shape[0]):
-                    feat1=feats1[b].permute(1,2,0).reshape(-1,feats1.shape[1])
-                    feat2=feats2[b].permute(1,2,0).reshape(-1,feats2.shape[1])
-                    
-                    coordinate=self.net.fine_matcher(torch.cat([feat1,feat2],dim=-1))
-                    coordinates.append(coordinate)
-                    
-                    fb_feat1=self.net.forward2(feats1[b].unsqueeze(0),kpts1[b].unsqueeze(0),normals1[b].unsqueeze(0))
-                    fb_feat2=self.net.forward2(feats2[b].unsqueeze(0),kpts2[b].unsqueeze(0),normals2[b].unsqueeze(0))
-                    
-                    fb_coordinate=self.net.fine_matcher(torch.cat([fb_feat1,fb_feat2],dim=-1))
-                    fb_coordinates.append(fb_coordinate)
-                    
-                    fb_feats1.append(fb_feat1.unsqueeze(0));fb_feats2.append(fb_feat2.unsqueeze(0))
-                    
-                    img1,img2=imgs1_t[b],imgs2_t[b]
-                    img1=img1.permute(1,2,0).expand(-1,-1,3).cpu().numpy() * 255
-                    img2=img2.permute(1,2,0).expand(-1,-1,3).cpu().numpy() * 255
-                    alike_kpt1=torch.tensor(self.alike_net.extract_alike_kpts(img1),device=self.dev)
-                    alike_kpt2=torch.tensor(self.alike_net.extract_alike_kpts(img2),device=self.dev)
-                    alike_kpts1.append(alike_kpt1);alike_kpts2.append(alike_kpt2)
+                # fb_feat1/2 形状: [1, 64, H, W] -> 展平为 [H*W, 64] 再拼接
+                fb_feat1_flat = fb_feat1.squeeze(0).permute(1, 2, 0).reshape(-1, fb_feat1.shape[1])
+                fb_feat2_flat = fb_feat2.squeeze(0).permute(1, 2, 0).reshape(-1, fb_feat2.shape[1])
+                fb_coordinate = self.model.fine_matcher(torch.cat([fb_feat1_flat, fb_feat2_flat], dim=-1))
+                fb_coordinates.append(fb_coordinate)
                 
-                # import pdb;pdb.set_trace()
-                for b in range(len(imgs1_np)):
-                    megadepth_depth1,megadepth_norm1=self.depth_net.extract(imgs1_np[b])
-                    megadepth_depth2,megadepth_norm2=self.depth_net.extract(imgs2_np[b])
-                    DA_normals1.append(megadepth_norm1);DA_normals2.append(megadepth_norm2)
-                    
-                # import pdb;pdb.set_trace()
-                fb_feats1=torch.cat(fb_feats1,dim=0)
-                fb_feats2=torch.cat(fb_feats2,dim=0)
-                fb_feats1=fb_feats1.reshape(feats1.shape[0],feats1.shape[2],feats1.shape[3],-1).permute(0,3,1,2)
-                fb_feats2=fb_feats2.reshape(feats2.shape[0],feats2.shape[2],feats2.shape[3],-1).permute(0,3,1,2)
+                fb_feats1.append(fb_feat1)
+                fb_feats2.append(fb_feat2)
                 
-                coordinates=torch.cat(coordinates,dim=0)
-                coordinates=coordinates.reshape(feats1.shape[0],feats1.shape[2],feats1.shape[3],-1).permute(0,3,1,2)
+                img1, img2 = imgs1_t[b], imgs2_t[b]
+                img1 = img1.permute(1, 2, 0).expand(-1, -1, 3).cpu().numpy() * 255
+                img2 = img2.permute(1, 2, 0).expand(-1, -1, 3).cpu().numpy() * 255
+                alike_kpt1 = torch.tensor(self.alike_net.extract_alike_kpts(img1), device=self.dev)
+                alike_kpt2 = torch.tensor(self.alike_net.extract_alike_kpts(img2), device=self.dev)
+                alike_kpts1.append(alike_kpt1)
+                alike_kpts2.append(alike_kpt2)
+            
+            # import pdb;pdb.set_trace()
+            for b in range(len(imgs1_np)):
+                megadepth_depth1, megadepth_norm1 = self.depth_net.extract(imgs1_np[b])
+                megadepth_depth2, megadepth_norm2 = self.depth_net.extract(imgs2_np[b])
+                DA_normals1.append(megadepth_norm1)
+                DA_normals2.append(megadepth_norm2)
                 
-                fb_coordinates=torch.cat(fb_coordinates,dim=0)
-                fb_coordinates=fb_coordinates.reshape(feats1.shape[0],feats1.shape[2],feats1.shape[3],-1).permute(0,3,1,2)
-                
-                # end=time.perf_counter()
-                # print(f"forward1 cost {end-start} seconds")
+            # import pdb;pdb.set_trace()
+            # fb_feats1/2 列表中每个元素形状是 [1, 64, H, W]，拼接后变成 [B, 64, H, W]
+            fb_feats1 = torch.cat(fb_feats1, dim=0)  # [B, 64, H, W]
+            fb_feats2 = torch.cat(fb_feats2, dim=0)  # [B, 64, H, W]
+            
+            coordinates = torch.cat(coordinates, dim=0)
+            coordinates = coordinates.reshape(feats1.shape[0], feats1.shape[2], feats1.shape[3], -1).permute(0, 3, 1, 2)
+            
+            fb_coordinates = torch.cat(fb_coordinates, dim=0)
+            fb_coordinates = fb_coordinates.reshape(feats1.shape[0], feats1.shape[2], feats1.shape[3], -1).permute(0, 3, 1, 2)
+            
+            # end=time.perf_counter()
+            # print(f"forward1 cost {end-start} seconds")
 
-                loss_items = []
+            loss_items = []
 
-                # import pdb;pdb.set_trace()
-                loss_info=self.loss_fn(
-                    feats1,fb_feats1,kpts1,normals1,
-                    feats2,fb_feats2,kpts2,normals2,
-                    positives_coarse,
-                    coordinates,fb_coordinates,
-                    alike_kpts1,alike_kpts2,
-                    DA_normals1,DA_normals2,
-                    self.megadepth_batch_size,self.coco_batch_size)
-                
-                loss_descs,acc_coarse=loss_info['loss_descs'],loss_info['acc_coarse']
-                loss_coordinates,acc_coordinates=loss_info['loss_coordinates'],loss_info['acc_coordinates']
-                loss_fb_descs,acc_fb_coarse=loss_info['loss_fb_descs'],loss_info['acc_fb_coarse']
-                loss_fb_coordinates,acc_fb_coordinates=loss_info['loss_fb_coordinates'],loss_info['acc_fb_coordinates']
-                loss_kpts,acc_kpt=loss_info['loss_kpts'],loss_info['acc_kpt']
-                loss_normals=loss_info['loss_normals']
-                
-                loss_items.append(loss_fb_descs.unsqueeze(0))
-                loss_items.append(loss_kpts.unsqueeze(0))
-                loss_items.append(loss_normals.unsqueeze(0))
-                
-                if self.use_coord_loss:
-                    loss_items.append(loss_fb_coordinates.unsqueeze(0))
+            # import pdb;pdb.set_trace()
+            loss_info = self.loss_fn(
+                feats1, fb_feats1, kpts1, normals1,
+                feats2, fb_feats2, kpts2, normals2,
+                positives_coarse,
+                coordinates, fb_coordinates,
+                alike_kpts1, alike_kpts2,
+                DA_normals1, DA_normals2,
+                self.megadepth_batch_size, self.coco_batch_size)
+            
+            loss_descs, acc_coarse = loss_info['loss_descs'], loss_info['acc_coarse']
+            loss_coordinates, acc_coordinates = loss_info['loss_coordinates'], loss_info['acc_coordinates']
+            loss_fb_descs, acc_fb_coarse = loss_info['loss_fb_descs'], loss_info['acc_fb_coarse']
+            loss_fb_coordinates, acc_fb_coordinates = loss_info['loss_fb_coordinates'], loss_info['acc_fb_coordinates']
+            loss_kpts, acc_kpt = loss_info['loss_kpts'], loss_info['acc_kpt']
+            loss_normals = loss_info['loss_normals']
+            
+            loss_items.append(loss_fb_descs.unsqueeze(0))
+            loss_items.append(loss_kpts.unsqueeze(0))
+            loss_items.append(loss_normals.unsqueeze(0))
+            
+            if self.use_coord_loss:
+                loss_items.append(loss_fb_coordinates.unsqueeze(0))
 
-                # nb_coarse = len(m1)
-                # nb_coarse = len(fb_m1)
-                loss = torch.cat(loss_items, -1).mean()
+            # nb_coarse = len(m1)
+            # nb_coarse = len(fb_m1)
+            loss = torch.cat(loss_items, -1).mean()
 
-                # Compute Backward Pass
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.)
-                self.opt.step()
-                self.opt.zero_grad()
-                self.scheduler.step()
+            # Compute Backward Pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.)
+            self.opt.step()
+            self.opt.zero_grad()
+            self.scheduler.step()
 
-                # import pdb;pdb.set_trace()
-                if (i+1) % self.save_ckpt_every == 0:
-                    print('saving iter ', i+1)
-                    torch.save(self.net.state_dict(), self.ckpt_save_path + f'/{self.model_name}_{i+1}.pth')
+            # import pdb;pdb.set_trace()
+            # 只在主进程保存 checkpoint
+            if (i+1) % self.save_ckpt_every == 0 and is_main_process():
+                print(f'[Rank {self.local_rank}] saving iter {i+1}')
+                # 保存底层模型的 state_dict（不是 DDP 包装后的）
+                torch.save(self.model.state_dict(), self.ckpt_save_path + f'/{self.model_name}_{i+1}.pth')
 
-                pbar.set_description(
-'Loss: {:.4f} \
-loss_descs: {:.3f} acc_coarse: {:.3f} \
-loss_coordinates: {:.3f} acc_coordinates: {:.3f} \
-loss_fb_descs: {:.3f} acc_fb_coarse: {:.3f} \
-loss_fb_coordinates: {:.3f} acc_fb_coordinates: {:.3f} \
-loss_kpts: {:.3f} acc_kpts: {:.3f} \
-loss_normals: {:.3f}'.format( \
-loss.item(), \
-loss_descs.item(), acc_coarse, \
-loss_coordinates.item(), acc_coordinates, \
-loss_fb_descs.item(), acc_fb_coarse, \
-loss_fb_coordinates.item(), acc_fb_coordinates, \
-loss_kpts.item(), acc_kpt, \
-loss_normals.item()) )
-                pbar.update(1)
+            # 更新进度条（只在主进程显示）
+            pbar.set_description(
+                'Loss: {:.4f} loss_descs: {:.3f} acc_coarse: {:.3f} '
+                'loss_coordinates: {:.3f} acc_coordinates: {:.3f} '
+                'loss_fb_descs: {:.3f} acc_fb_coarse: {:.3f} '
+                'loss_fb_coordinates: {:.3f} acc_fb_coordinates: {:.3f} '
+                'loss_kpts: {:.3f} acc_kpts: {:.3f} '
+                'loss_normals: {:.3f}'.format(
+                    loss.item(),
+                    loss_descs.item(), acc_coarse,
+                    loss_coordinates.item(), acc_coordinates,
+                    loss_fb_descs.item(), acc_fb_coarse,
+                    loss_fb_coordinates.item(), acc_fb_coordinates,
+                    loss_kpts.item(), acc_kpt,
+                    loss_normals.item()))
+            pbar.update(1)
 
-                # Log metrics
+            # Log metrics（只在主进程记录 TensorBoard）
+            if is_main_process() and self.writer is not None:
                 self.writer.add_scalar('Loss/total', loss.item(), i)
                 self.writer.add_scalar('Accuracy/acc_coarse', acc_coarse, i)
                 self.writer.add_scalar('Accuracy/acc_coordinates', acc_coordinates, i)
@@ -340,12 +480,20 @@ loss_normals.item()) )
                 self.writer.add_scalar('Loss/fb_coordinates', loss_fb_coordinates.item(), i)
                 self.writer.add_scalar('Loss/kpts', loss_kpts.item(), i)
                 self.writer.add_scalar('Loss/normals', loss_normals.item(), i)
+        
+        # 关闭进度条
+        pbar.close()
 
 
 
 if __name__ == '__main__':
     
-    setproctitle.setproctitle(args.name)
+    # 设置分布式训练环境
+    args = setup_distributed(args)
+    
+    # 只在主进程设置进程名
+    if is_main_process():
+        setproctitle.setproctitle(args.name)
 
     trainer = Trainer(
         megadepth_root_path=args.megadepth_root_path, 
@@ -362,8 +510,16 @@ if __name__ == '__main__':
         device_num=args.device_num,
         dry_run=args.dry_run,
         save_ckpt_every=args.save_ckpt_every,
-        use_coord_loss=args.use_coord_loss
+        use_coord_loss=args.use_coord_loss,
+        # 分布式训练参数
+        distributed=args.distributed,
+        local_rank=args.local_rank,
+        world_size=args.world_size
     )
 
-    #The most fun part
-    trainer.train()
+    try:
+        # The most fun part
+        trainer.train()
+    finally:
+        # 清理分布式训练环境
+        cleanup_distributed()

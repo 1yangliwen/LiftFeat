@@ -5,5 +5,7 @@ output
 issues
 ckpts
 third_party
+weights
 dataset/visual_odometry
+trained_weights
 __pycache__/

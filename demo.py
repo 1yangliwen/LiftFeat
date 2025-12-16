@@ -102,7 +102,7 @@ if __name__=="__main__":
         mkpts1,mkpts2 = opencv_knn_match(descs1,descs2,kpts1,kpts2)
     else:
         mkpts1,mkpts2=liftfeat.match_liftfeat(img1,img2)
-    
+    print(f"Number of matches: {len(mkpts1)}")
     
     canvas=warp_corners_and_draw_matches(mkpts1,mkpts2,img1,img2)
     
