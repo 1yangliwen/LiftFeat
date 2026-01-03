@@ -9,3 +9,6 @@ weights
 dataset/visual_odometry
 trained_weights
 __pycache__/
+commmand_record.sh
+antissh.sh
+match.jpg

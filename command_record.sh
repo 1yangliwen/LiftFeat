@@ -13,3 +13,4 @@ python train.py \
 python evaluation/MegaDepth1500_evaluation.py --gpu 6
 
 python demo.py --img1=assert/query.jpg --img2=assert/ref.jpg
+
